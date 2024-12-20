@@ -8,7 +8,7 @@ from tqdm import tqdm
 server_url = "http://127.0.0.1:5000/generate"
 
 # 加载数据集
-dataset_path = "ag_news_train.parquet"
+dataset_path = "../dataset/ag_news_test.parquet"
 df = pd.read_parquet(dataset_path)
 
 # 提取文本列
