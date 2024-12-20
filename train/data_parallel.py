@@ -9,6 +9,7 @@ import time
 import torch.distributed as dist
 import os
 from torch.nn.parallel import DistributedDataParallel as DDP
+from thop import profile  # 导入 thop 库
 
 # 自定义的 GPT-2 网络结构
 class MultiHeadSelfAttention(nn.Module):
@@ -176,6 +177,7 @@ if __name__ == "__main__":
 
     # Training loop with batch time tracking
     batch_times = []  # List to store time taken for each batch
+    total_flops = 0  # 用于统计所有机器的 FLOPS 总和
 
     for epoch in range(num_epochs):
         model.train()
@@ -185,9 +187,13 @@ if __name__ == "__main__":
         for i, batch in enumerate(train_loader):
             batch_start_time = time.time()  # Start timer for the current batch
             batch = batch.to(device).long()
-            
+
+            # 计算 FLOPS
+            flops, _ = profile(model, inputs=(batch,))  # 使用 thop.profile 计算 FLOPS
+            total_flops += flops  # 累加 FLOPS
+
             optimizer.zero_grad()
-            
+
             with autocast():
                 output = model(batch)
                 loss = loss_fn(output.view(-1, vocab_size), batch.view(-1))
@@ -201,31 +207,13 @@ if __name__ == "__main__":
             batch_times.append(batch_time)  # Store batch time
             
             if local_rank == 0:
-                print(f"Epoch {epoch + 1}, Batch {i + 1}/{len(train_loader)}, Loss: {loss.item()}, Batch Time: {batch_time:.4f}s")
+                # 打印每个 batch 的 FLOPS 和处理时间
+                print(f"Epoch {epoch + 1}, Batch {i + 1}/{len(train_loader)}, Loss: {loss.item()}, Batch Time: {batch_time:.4f}s, FLOPS: {flops / 1e9:.2f} GFLOPS")
 
         epoch_end_time = time.time()
-        print(f"Epoch {epoch + 1} completed in {(epoch_end_time - epoch_start_time):.2f}s")
-        print()
-
-    # Calculate average batch time
-    average_batch_time = sum(batch_times) / len(batch_times)
-    print(f"Average batch time: {average_batch_time:.4f}s")
-
-
-    # 测试模型
-    model.eval()
-    total_loss = 0
-    with torch.no_grad():
-        for batch in test_loader:
-            batch = batch.to(device).long()
-            with autocast():
-                output = model(batch)
-                loss = loss_fn(output.view(-1, vocab_size), batch.view(-1))
-            total_loss += loss.item()
-
-    if local_rank == 0:
-        print(f"Test Loss: {total_loss / len(test_loader)}")
-
+        if local_rank == 0:
+            print(f"Epoch {epoch + 1} completed in {epoch_end_time - epoch_start_time:.4f}s")
+            print(f"Total FLOPS for this epoch: {total_flops / 1e9:.2f} GFLOPS")
+    
     # 清理分布式环境
     cleanup_distributed()
-
