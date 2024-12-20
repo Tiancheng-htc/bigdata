@@ -15,8 +15,8 @@ df = pd.read_parquet(dataset_path)
 texts = df["text"].tolist()
 
 # 配置参数
-rps = 10  # 请求每秒 (Requests Per Second)
-duration = 10  # 测试持续时间（秒）
+rps = 20  # 请求每秒 (Requests Per Second)
+duration = 30  # 测试持续时间（秒）
 
 # 泊松间隔
 intervals = np.random.poisson(1 / rps, int(rps * duration))
@@ -60,4 +60,4 @@ end_time = time.time()
 # 输出结果
 print(f"Total Requests: {throughput}")
 print(f"Throughput: {throughput / (end_time - start_time):.2f} requests/sec")
-print(f"Average latency: {np.mean(latency):.2f} sec")
+print(f"p95 Latency: {np.percentile(latency, 95):.4f} seconds")

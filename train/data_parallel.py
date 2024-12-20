@@ -2,9 +2,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from datasets import load_dataset
-from torch.utils.data import DataLoader, Dataset, default_collate
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import GradScaler, autocast
 import time
+import torch.distributed as dist
+import os
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # 自定义的 GPT-2 网络结构
 class MultiHeadSelfAttention(nn.Module):
@@ -86,6 +90,17 @@ class GPT2(nn.Module):
 
         return self.fc_out(out)
 
+# 初始化分布式训练
+def setup_distributed():
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank
+
+# 清理分布式环境
+def cleanup_distributed():
+    dist.destroy_process_group()
+
 # 自定义数据集类
 class CustomDataset(Dataset):
     def __init__(self, texts):
@@ -104,6 +119,11 @@ def collate_fn(batch):
     padded = [item + [0] * (max_len - len(item)) for item in batch]
     return torch.tensor(padded)
 
+# 数据预处理
+def preprocess_data(data):
+    tokenizer = lambda text: [ord(c) for c in text]  # 简单的字符级 tokenizer
+    return [tokenizer(item['text'])[:max_length] for item in data]
+
 # 设置超参数
 embed_size = 1024
 heads = 16
@@ -116,73 +136,90 @@ batch_size = 16
 num_epochs = 1
 learning_rate = 3e-5
 
-# 加载数据集
-dataset = load_dataset("wangrongsheng/ag_news")
+if __name__ == "__main__":
+    # 设置分布式
+    local_rank = setup_distributed()
+    device = torch.device(f"cuda:{local_rank}")
 
-# 数据预处理
-def preprocess_data(data):
-    tokenizer = lambda text: [ord(c) for c in text]  # 简单的字符级 tokenizer
-    return [tokenizer(item['text'])[:max_length] for item in data]
+    # 加载数据集
+    dataset = load_dataset("wangrongsheng/ag_news")
+    train_tokens = preprocess_data(dataset['train'])
+    test_tokens = preprocess_data(dataset['test'])
 
-train_tokens = preprocess_data(dataset['train'])
-test_tokens = preprocess_data(dataset['test'])
+    # 创建自定义数据集
+    train_dataset = CustomDataset(train_tokens)
+    test_dataset = CustomDataset(test_tokens)
 
-# 创建自定义数据集
-train_dataset = CustomDataset(train_tokens)
-test_dataset = CustomDataset(test_tokens)
+    # 使用 DistributedSampler
+    train_sampler = DistributedSampler(train_dataset)
+    test_sampler = DistributedSampler(test_dataset)
 
-# 创建 DataLoader
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=collate_fn)
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, sampler=train_sampler, collate_fn=collate_fn
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, sampler=test_sampler, collate_fn=collate_fn
+    )
 
-# 初始化模型并移动到 GPU
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = GPT2(embed_size, heads, num_layers, vocab_size, max_length, dropout, expansion_factor).to(device)
-optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
-loss_fn = nn.CrossEntropyLoss()
-scaler = GradScaler()
+    # 初始化模型并移动到 GPU
+    model = GPT2(embed_size, heads, num_layers, vocab_size, max_length, dropout, expansion_factor).to(device)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
+    loss_fn = nn.CrossEntropyLoss()
+    scaler = GradScaler()
 
-# 训练模型
-batch_time = []
-for epoch in range(num_epochs):
-    model.train()
-    epoch_start_time = time.time()
-    for i, batch in enumerate(train_loader):
-        batch_start_time = time.time()
-        batch = batch.to(device).long()
-        optimizer.zero_grad()
-        with autocast():
-            output = model(batch)
-            loss = loss_fn(output.view(-1, vocab_size), batch.view(-1))
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        batch_end_time = time.time()
-        batch_time.append(batch_end_time - batch_start_time)
-        print(f"Epoch {epoch + 1}, Batch {i + 1}/{len(train_loader)}, Loss: {loss.item()}, Time: {batch_end_time - batch_start_time:.2f}s")
-    
-    epoch_end_time = time.time()
+    # Training loop with batch time tracking
+    batch_times = []  # List to store time taken for each batch
 
-    print(f"Epoch {epoch + 1} completed in {(epoch_end_time-epoch_start_time):.2f}s")
-    print()
+    for epoch in range(num_epochs):
+        model.train()
+        epoch_start_time = time.time()
+        train_sampler.set_epoch(epoch)  # Reset sampler every epoch
 
-# 打印每个 epoch 的平均时间
-average_batch_time = sum(batch_time) / len(batch_time)
-print(f"Average batch time: {average_batch_time:.4f}s")
+        for i, batch in enumerate(train_loader):
+            batch_start_time = time.time()  # Start timer for the current batch
+            batch = batch.to(device).long()
+            
+            optimizer.zero_grad()
+            
+            with autocast():
+                output = model(batch)
+                loss = loss_fn(output.view(-1, vocab_size), batch.view(-1))
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            batch_end_time = time.time()  # End timer for the current batch
+            batch_time = batch_end_time - batch_start_time
+            batch_times.append(batch_time)  # Store batch time
+            
+            if local_rank == 0:
+                print(f"Epoch {epoch + 1}, Batch {i + 1}/{len(train_loader)}, Loss: {loss.item()}, Batch Time: {batch_time:.4f}s")
 
-# 保存模型
-torch.save(model.state_dict(), "../model/gpt2_model.pth")
-print("Model saved as gpt2_model.pth")
+        epoch_end_time = time.time()
+        print(f"Epoch {epoch + 1} completed in {(epoch_end_time - epoch_start_time):.2f}s")
+        print()
 
-# 测试模型
-model.eval()
-total_loss = 0
-with torch.no_grad():
-    for batch in test_loader:
-        batch = batch.to(device).long()
-        with autocast():
-            output = model(batch)
-            loss = loss_fn(output.view(-1, vocab_size), batch.view(-1))
-        total_loss += loss.item()
+    # Calculate average batch time
+    average_batch_time = sum(batch_times) / len(batch_times)
+    print(f"Average batch time: {average_batch_time:.4f}s")
 
-print(f"Test Loss: {total_loss / len(test_loader)}")
+
+    # 测试模型
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for batch in test_loader:
+            batch = batch.to(device).long()
+            with autocast():
+                output = model(batch)
+                loss = loss_fn(output.view(-1, vocab_size), batch.view(-1))
+            total_loss += loss.item()
+
+    if local_rank == 0:
+        print(f"Test Loss: {total_loss / len(test_loader)}")
+
+    # 清理分布式环境
+    cleanup_distributed()
+
