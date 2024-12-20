@@ -112,7 +112,7 @@ vocab_size = 50257
 max_length = 1024
 dropout = 0.1
 expansion_factor = 4
-batch_size = 32
+batch_size = 16
 num_epochs = 1
 learning_rate = 3e-5
 
@@ -143,6 +143,7 @@ loss_fn = nn.CrossEntropyLoss()
 scaler = GradScaler()
 
 # 训练模型
+epoch_time = []
 for epoch in range(num_epochs):
     model.train()
     epoch_start_time = time.time()
@@ -158,8 +159,17 @@ for epoch in range(num_epochs):
         scaler.update()
         batch_end_time = time.time()
         print(f"Epoch {epoch + 1}, Batch {i + 1}/{len(train_loader)}, Loss: {loss.item()}, Time: {batch_end_time - batch_start_time:.2f}s")
+    
     epoch_end_time = time.time()
-    print(f"Epoch {epoch + 1} completed in {epoch_end_time - epoch_start_time:.2f}s")
+    epoch_duration = epoch_end_time - epoch_start_time
+    epoch_time.append(epoch_duration)
+
+    print(f"Epoch {epoch + 1} completed in {epoch_duration:.2f}s")
+    print()
+
+# 打印每个 epoch 的平均时间
+average_epoch_time = sum(epoch_time) / len(epoch_time)
+print(f"Average epoch time: {average_epoch_time:.2f}s")
 
 # 保存模型
 torch.save(model.state_dict(), "../model/gpt2_model.pth")
