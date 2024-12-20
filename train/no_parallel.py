@@ -143,7 +143,7 @@ loss_fn = nn.CrossEntropyLoss()
 scaler = GradScaler()
 
 # 训练模型
-epoch_time = []
+batch_time = []
 for epoch in range(num_epochs):
     model.train()
     epoch_start_time = time.time()
@@ -158,18 +158,17 @@ for epoch in range(num_epochs):
         scaler.step(optimizer)
         scaler.update()
         batch_end_time = time.time()
+        batch_time.append(batch_end_time - batch_start_time)
         print(f"Epoch {epoch + 1}, Batch {i + 1}/{len(train_loader)}, Loss: {loss.item()}, Time: {batch_end_time - batch_start_time:.2f}s")
     
     epoch_end_time = time.time()
-    epoch_duration = epoch_end_time - epoch_start_time
-    epoch_time.append(epoch_duration)
 
     print(f"Epoch {epoch + 1} completed in {epoch_duration:.2f}s")
     print()
 
 # 打印每个 epoch 的平均时间
-average_epoch_time = sum(epoch_time) / len(epoch_time)
-print(f"Average epoch time: {average_epoch_time:.2f}s")
+average_batch_time = sum(batch_time) / len(batch_time)
+print(f"Average batch time: {average_batch1_time:.4f}s")
 
 # 保存模型
 torch.save(model.state_dict(), "../model/gpt2_model.pth")
