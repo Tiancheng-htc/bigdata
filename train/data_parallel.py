@@ -92,7 +92,12 @@ class GPT2(nn.Module):
 
 # 初始化分布式训练
 def setup_distributed():
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(
+        backend="nccl", 
+        init_method="tcp://192.168.123.134:2024",  # 主节点的 IP 和端口
+        world_size=int(os.environ["WORLD_SIZE"]), 
+        rank=int(os.environ["RANK"])
+    )
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     return local_rank
@@ -140,6 +145,7 @@ if __name__ == "__main__":
     # 设置分布式
     local_rank = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")
+    print(f"Local Rank: {local_rank}")
 
     # 加载数据集
     dataset = load_dataset("wangrongsheng/ag_news")
