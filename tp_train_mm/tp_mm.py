@@ -5,11 +5,61 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset
 from torch.cuda.amp import GradScaler, autocast
 import time
+from datasets import load_dataset
 
 # 初始化分布式环境
 def init_distributed():
     dist.init_process_group(backend='nccl')  # 使用 NCCL 后端进行高效的 GPU 通信
     torch.cuda.set_device(dist.get_rank())  # 将每个进程绑定到对应的 GPU
+
+# 自定义数据集类
+class CustomDataset(Dataset):
+    def __init__(self, texts):
+        self.texts = texts
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        return torch.tensor(self.texts[idx])
+
+# 动态填充的 collate_fn
+def collate_fn(batch):
+    batch = [item.tolist() for item in batch]
+    max_len = max(len(item) for item in batch)
+    padded = [item + [0] * (max_len - len(item)) for item in batch]
+    return torch.tensor(padded)
+
+# 设置超参数
+embed_size = 1024
+heads = 16
+num_layers = 24
+vocab_size = 50257
+max_length = 1024
+dropout = 0.1
+expansion_factor = 4
+batch_size = 16
+num_epochs = 1
+learning_rate = 3e-5
+
+# 加载数据集
+dataset = load_dataset("wangrongsheng/ag_news")
+
+# 数据预处理
+def preprocess_data(data):
+    tokenizer = lambda text: [ord(c) for c in text]  # 简单的字符级 tokenizer
+    return [tokenizer(item['text'])[:max_length] for item in data]
+
+train_tokens = preprocess_data(dataset['train'])
+test_tokens = preprocess_data(dataset['test'])
+
+# 创建自定义数据集
+train_dataset = CustomDataset(train_tokens)
+test_dataset = CustomDataset(test_tokens)
+
+# 创建 DataLoader
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=collate_fn)
 
 # 自定义 GPT-2 网络结构
 class MultiHeadSelfAttention(nn.Module):
@@ -106,18 +156,6 @@ class GPT2(nn.Module):
             out = layer(out)
 
         return self.fc_out(out)
-
-# 设置超参数
-embed_size = 1024
-heads = 16
-num_layers = 24
-vocab_size = 50257
-max_length = 1024
-dropout = 0.1
-expansion_factor = 4
-batch_size = 16
-num_epochs = 1
-learning_rate = 3e-5
 
 # 初始化分布式环境
 init_distributed()
