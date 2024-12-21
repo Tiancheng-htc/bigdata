@@ -7,6 +7,7 @@ from torch.cuda.amp import GradScaler, autocast
 import time
 from datasets import load_dataset
 import os
+import pickle
 
 # 初始化分布式环境
 def init_distributed():
@@ -51,7 +52,11 @@ num_epochs = 1
 learning_rate = 3e-5
 
 # 加载数据集
-dataset = load_dataset("wangrongsheng/ag_news")
+# dataset = load_dataset("wangrongsheng/ag_news")
+
+if os.path.exists('train_dataset.pkl') :
+    with open('train_dataset.pkl', 'rb') as f:
+        train_dataset = pickle.load(f)
 
 # 数据预处理
 def preprocess_data(data):
