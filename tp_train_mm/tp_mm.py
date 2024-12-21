@@ -13,7 +13,7 @@ import pickle
 def init_distributed():
     dist.init_process_group(
         backend="nccl", 
-        init_method="tcp://192.168.123.199:2024",  # 主节点的 IP 和端口
+        init_method="tcp://192.168.123.199:12345",  # 主节点的 IP 和端口
         world_size=int(os.environ["WORLD_SIZE"]), 
         rank=int(os.environ["RANK"])
     )
@@ -171,7 +171,9 @@ class GPT2(nn.Module):
         return self.fc_out(out)
 
 # 初始化分布式环境
+print("start init")
 init_distributed()
+print("init done!")
 
 # 初始化模型并移动到对应 GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -180,6 +182,7 @@ optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
 loss_fn = nn.CrossEntropyLoss()
 scaler = GradScaler()
 
+print("start training")
 # 训练模型
 for epoch in range(num_epochs):
     model.train()
