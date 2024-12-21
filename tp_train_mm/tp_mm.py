@@ -6,6 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import GradScaler, autocast
 import time
 import argparse
+from datasets import load_dataset
 
 # 初始化分布式环境
 def init_distributed_mode(args):
