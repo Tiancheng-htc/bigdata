@@ -13,6 +13,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor.parallel import RowwiseParallel, ColwiseParallel
 import torch.distributed as dist
 from thop import profile  # 导入 thop
+from torch.distributed._tensor import Shard, Replicate
 
 # print(torch.__version__)
 
