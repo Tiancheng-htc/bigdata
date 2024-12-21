@@ -3,13 +3,14 @@ import torch.nn as nn
 import torch.optim as optim
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import GradScaler, autocast
-import time
-import torch.distributed as dist
 import os
-from torch.nn.parallel import DistributedDataParallel as DDP
-from thop import profile  # 导入 thop 库
+import time
+from torch.distributed import init_process_group
+from torch.distributed.tensor.parallel import init_device_mesh, parallelize_module
+from torch.distributed.tensor.parallel import RowwiseParallel, ColwiseParallel, Shard, Replicate
+import torch.distributed as dist
+from thop import profile  # 导入 thop
 
 # 自定义的 GPT-2 网络结构
 class MultiHeadSelfAttention(nn.Module):
@@ -91,22 +92,6 @@ class GPT2(nn.Module):
 
         return self.fc_out(out)
 
-# 初始化分布式训练
-def setup_distributed():
-    dist.init_process_group(
-        backend="nccl", 
-        init_method="tcp://192.168.123.134:2024",  # 主节点的 IP 和端口
-        world_size=int(os.environ["WORLD_SIZE"]), 
-        rank=int(os.environ["RANK"])
-    )
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    return local_rank
-
-# 清理分布式环境
-def cleanup_distributed():
-    dist.destroy_process_group()
-
 # 自定义数据集类
 class CustomDataset(Dataset):
     def __init__(self, texts):
@@ -125,11 +110,6 @@ def collate_fn(batch):
     padded = [item + [0] * (max_len - len(item)) for item in batch]
     return torch.tensor(padded)
 
-# 数据预处理
-def preprocess_data(data):
-    tokenizer = lambda text: [ord(c) for c in text]  # 简单的字符级 tokenizer
-    return [tokenizer(item['text'])[:max_length] for item in data]
-
 # 设置超参数
 embed_size = 1024
 heads = 16
@@ -142,78 +122,109 @@ batch_size = 16
 num_epochs = 1
 learning_rate = 3e-5
 
-if __name__ == "__main__":
-    # 设置分布式
-    local_rank = setup_distributed()
-    device = torch.device(f"cuda:{local_rank}")
-    print(f"Local Rank: {local_rank}")
+# 加载数据集
+dataset = load_dataset("wangrongsheng/ag_news")
 
-    # 加载数据集
-    dataset = load_dataset("wangrongsheng/ag_news")
-    train_tokens = preprocess_data(dataset['train'])
-    test_tokens = preprocess_data(dataset['test'])
+# 数据预处理
+def preprocess_data(data):
+    tokenizer = lambda text: [ord(c) for c in text]  # 简单的字符级 tokenizer
+    return [tokenizer(item['text'])[:max_length] for item in data]
 
-    # 创建自定义数据集
-    train_dataset = CustomDataset(train_tokens)
-    test_dataset = CustomDataset(test_tokens)
+train_tokens = preprocess_data(dataset['train'])
+test_tokens = preprocess_data(dataset['test'])
 
-    # 使用 DistributedSampler
-    train_sampler = DistributedSampler(train_dataset)
-    test_sampler = DistributedSampler(test_dataset)
+# 创建自定义数据集
+train_dataset = CustomDataset(train_tokens)
+test_dataset = CustomDataset(test_tokens)
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, sampler=train_sampler, collate_fn=collate_fn
-    )
-    test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, sampler=test_sampler, collate_fn=collate_fn
-    )
+# 创建 DataLoader
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=collate_fn)
 
-    # 初始化模型并移动到 GPU
-    model = GPT2(embed_size, heads, num_layers, vocab_size, max_length, dropout, expansion_factor).to(device)
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
-    loss_fn = nn.CrossEntropyLoss()
-    scaler = GradScaler()
+# 设置分布式环境
+rank = int(os.environ["RANK"])  # 当前进程的 rank
+world_size = int(os.environ["WORLD_SIZE"])  # 总的进程数
+init_process_group(backend='nccl', rank=rank, world_size=world_size)
 
-    # Training loop with batch time tracking
-    batch_times = []  # List to store time taken for each batch
-    total_flops = 0  # 用于统计所有机器的 FLOPS 总和
+# 设置设备网格，跨两个节点
+device_mesh = init_device_mesh("cuda", (world_size, 1), mesh_dim_names=("tp",))
+tp_mesh = device_mesh["tp"]
 
-    for epoch in range(num_epochs):
-        model.train()
-        epoch_start_time = time.time()
-        train_sampler.set_epoch(epoch)  # Reset sampler every epoch
+# 创建模型并并行化
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = GPT2(embed_size, heads, num_layers, vocab_size, max_length, dropout, expansion_factor).to(device)
 
-        for i, batch in enumerate(train_loader):
-            batch_start_time = time.time()  # Start timer for the current batch
-            batch = batch.to(device).long()
+# 通过张量并行化模型
+model = parallelize_module(
+    model,
+    tp_mesh,
+    {
+        "word_embeddings": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(0)),
+        "fc_out": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate())
+    }
+)
 
-            # 计算 FLOPS
-            flops, _ = profile(model, inputs=(batch,))  # 使用 thop.profile 计算 FLOPS
-            total_flops += flops  # 累加 FLOPS
+# 使用 DistributedDataParallel 包装模型以支持分布式训练
+model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank], output_device=rank)
 
-            optimizer.zero_grad()
+optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
+loss_fn = nn.CrossEntropyLoss()
+scaler = GradScaler()
 
-            with autocast():
-                output = model(batch)
-                loss = loss_fn(output.view(-1, vocab_size), batch.view(-1))
-            
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            
-            batch_end_time = time.time()  # End timer for the current batch
-            batch_time = batch_end_time - batch_start_time
-            batch_times.append(batch_time)  # Store batch time
-            
-            if local_rank == 0:
-                # 打印每个 batch 的 FLOPS 和处理时间
-                print(f"Epoch {epoch + 1}, Batch {i + 1}/{len(train_loader)}, Loss: {loss.item()}, Batch Time: {batch_time:.4f}s, FLOPS: {flops / 1e9:.2f} GFLOPS")
+# 训练模型
+batch_time = []
+flops_time = []
+for epoch in range(num_epochs):
+    model.train()
+    epoch_start_time = time.time()
+    for i, batch in enumerate(train_loader):
+        batch_start_time = time.time()
+        batch = batch.to(device).long()
+        optimizer.zero_grad()
 
-        epoch_end_time = time.time()
-        if local_rank == 0:
-            print(f"Epoch {epoch + 1} completed in {epoch_end_time - epoch_start_time:.4f}s")
-            print(f"Total FLOPS for this epoch: {total_flops / 1e9:.2f} GFLOPS")
-    
-    # 清理分布式环境
-    cleanup_distributed()
+        # 使用 thop.profile 计算 FLOPS
+        with autocast():
+            output = model(batch)
+            loss = loss_fn(output.view(-1, vocab_size), batch.view(-1))
+
+        # 计算 FLOPS
+        flops, params = profile(model, inputs=(batch,))
+        flops_time.append(flops)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        batch_end_time = time.time()
+        batch_time.append(batch_end_time - batch_start_time)
+        
+        print(f"Epoch {epoch + 1}, Batch {i + 1}/{len(train_loader)}, Loss: {loss.item()}, Time: {batch_end_time - batch_start_time:.2f}s, FLOPS: {flops / 1e9:.2f} GFLOPS")
+
+    epoch_end_time = time.time()
+    print(f"Epoch {epoch + 1} completed in {(epoch_end_time-epoch_start_time):.2f}s")
+    print()
+
+# 打印每个 epoch 的平均时间
+average_batch_time = sum(batch_time) / len(batch_time)
+print(f"Average batch time: {average_batch_time:.4f}s")
+
+# 打印每个batch的FLOPS平均值
+average_flops = sum(flops_time) / len(flops_time)
+print(f"Average FLOPS per batch: {average_flops / 1e9:.2f} GFLOPS")
+
+# 保存模型
+if rank == 0:
+    torch.save(model.state_dict(), "../model/gpt2_model.pth")
+    print("Model saved as gpt2_model.pth")
+
+# 测试模型
+model.eval()
+total_loss = 0
+with torch.no_grad():
+    for batch in test_loader:
+        batch = batch.to(device).long()
+        with autocast():
+            output = model(batch)
+            loss = loss_fn(output.view(-1, vocab_size), batch.view(-1))
+        total_loss += loss.item()
+
+print(f"Test Loss: {total_loss / len(test_loader)}")
