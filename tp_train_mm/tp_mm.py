@@ -9,7 +9,8 @@ import time
 from torch.distributed import init_process_group
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor.parallel import parallelize_module
-from torch.distributed.tensor.parallel import RowwiseParallel, ColwiseParallel, Shard, Replicate
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.tensor.parallel import RowwiseParallel, ColwiseParallel
 import torch.distributed as dist
 from thop import profile  # 导入 thop
 
