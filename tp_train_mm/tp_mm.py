@@ -54,8 +54,8 @@ learning_rate = 3e-5
 # 加载数据集
 # dataset = load_dataset("wangrongsheng/ag_news")
 
-if os.path.exists('train_dataset.pkl') :
-    with open('train_dataset.pkl', 'rb') as f:
+if os.path.exists('../train_dataset.pkl') :
+    with open('../train_dataset.pkl', 'rb') as f:
         train_dataset = pickle.load(f)
 
 # 数据预处理
