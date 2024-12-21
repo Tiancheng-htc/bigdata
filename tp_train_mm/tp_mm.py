@@ -1,52 +1,57 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from datasets import load_dataset
-from torch.utils.data import DataLoader, Dataset
-from torch.cuda.amp import GradScaler, autocast
-import os
-import time
-from torch.distributed import init_process_group
-from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor.parallel import parallelize_module
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.tensor.parallel import RowwiseParallel, ColwiseParallel
 import torch.distributed as dist
-from thop import profile  # 导入 thop
-from torch.distributed._tensor import Shard, Replicate
+from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import GradScaler, autocast
+import time
+import argparse
 
-# print(torch.__version__)
+# 初始化分布式环境
+def init_distributed_mode(args):
+    dist.init_process_group(backend='nccl', init_method="env://")
+    torch.cuda.set_device(args.local_rank)
 
-# 自定义的 GPT-2 网络结构
+# 自定义 GPT-2 网络结构，分割层
 class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, embed_size, heads):
+    def __init__(self, embed_size, heads, device1, device2):
         super(MultiHeadSelfAttention, self).__init__()
+        self.device1 = device1
+        self.device2 = device2
         self.heads = heads
         self.embed_size = embed_size
         self.head_dim = embed_size // heads
 
         assert (self.head_dim * heads == embed_size), "Embedding size must be divisible by heads"
 
-        self.values = nn.Linear(embed_size, embed_size, bias=False)
-        self.keys = nn.Linear(embed_size, embed_size, bias=False)
-        self.queries = nn.Linear(embed_size, embed_size, bias=False)
-        self.fc_out = nn.Linear(embed_size, embed_size)
+        # 将不同的张量操作分配到不同的设备上
+        self.values = nn.Linear(embed_size, embed_size, bias=False).to(self.device1)
+        self.keys = nn.Linear(embed_size, embed_size, bias=False).to(self.device2)
+        self.queries = nn.Linear(embed_size, embed_size, bias=False).to(self.device2)
+        self.fc_out = nn.Linear(embed_size, embed_size).to(self.device2)
 
     def forward(self, x):
         N, seq_length, _ = x.shape
-        values = self.values(x)
-        keys = self.keys(x)
-        queries = self.queries(x)
+        values = self.values(x)  # 在device1上
+        keys = self.keys(x)  # 在device2上
+        queries = self.queries(x)  # 在device2上
 
-        values = values.view(N, seq_length, self.heads, self.head_dim).permute(0, 2, 1, 3)
-        keys = keys.view(N, seq_length, self.heads, self.head_dim).permute(0, 2, 1, 3)
-        queries = queries.view(N, seq_length, self.heads, self.head_dim).permute(0, 2, 1, 3)
+        # 张量分割：将张量切分到不同的设备上
+        values = values.view(N, seq_length, self.heads, self.head_dim).permute(0, 2, 1, 3).to(self.device1)  # device1
+        keys = keys.view(N, seq_length, self.heads, self.head_dim).permute(0, 2, 1, 3).to(self.device2)  # device2
+        queries = queries.view(N, seq_length, self.heads, self.head_dim).permute(0, 2, 1, 3).to(self.device2)  # device2
 
-        energy = torch.einsum("nqhd,nkhd->nqkh", [queries, keys])
-        attention = torch.softmax(energy / (self.head_dim ** 0.5), dim=3)
-        out = torch.einsum("nqkh,nvhd->nqhd", [attention, values]).reshape(N, seq_length, self.embed_size)
+        # 计算注意力：keys 和 queries 在 device2 上，values 在 device1 上
+        energy = torch.einsum("nqhd,nkhd->nqkh", [queries, keys])  # 计算注意力分数，device2
+        attention = torch.softmax(energy / (self.head_dim ** 0.5), dim=3)  # softmax 在 device2
+        out = torch.einsum("nqkh,nvhd->nqhd", [attention, values])  # 张量分割：将 attention 和 values 在 device1 上计算
+        out = out.reshape(N, seq_length, self.embed_size)
 
-        return self.fc_out(out)
+        # 跨节点同步：使用 all_reduce 合并所有节点上的结果
+        dist.all_reduce(out, op=dist.ReduceOp.SUM)  # 跨节点通信：汇总张量
+
+        out = self.fc_out(out)  # 最后全连接层在 device2 上
+        return out
 
 class FeedForward(nn.Module):
     def __init__(self, embed_size, expansion_factor):
@@ -58,9 +63,9 @@ class FeedForward(nn.Module):
         return self.fc2(torch.relu(self.fc1(x)))
 
 class Block(nn.Module):
-    def __init__(self, embed_size, heads, dropout, expansion_factor):
+    def __init__(self, embed_size, heads, dropout, expansion_factor, device1, device2):
         super(Block, self).__init__()
-        self.attention = MultiHeadSelfAttention(embed_size, heads)
+        self.attention = MultiHeadSelfAttention(embed_size, heads, device1, device2)
         self.norm1 = nn.LayerNorm(embed_size)
         self.norm2 = nn.LayerNorm(embed_size)
         self.feed_forward = FeedForward(embed_size, expansion_factor)
@@ -75,14 +80,18 @@ class Block(nn.Module):
         return x
 
 class GPT2(nn.Module):
-    def __init__(self, embed_size, heads, num_layers, vocab_size, max_length, dropout, expansion_factor):
+    def __init__(self, embed_size, heads, num_layers, vocab_size, max_length, dropout, expansion_factor, device1, device2):
         super(GPT2, self).__init__()
-        self.word_embeddings = nn.Embedding(vocab_size, embed_size)
-        self.position_embeddings = nn.Embedding(max_length, embed_size)
-        self.layers = nn.ModuleList(
-            [Block(embed_size, heads, dropout, expansion_factor) for _ in range(num_layers)]
-        )
-        self.fc_out = nn.Linear(embed_size, vocab_size)
+        self.device1 = device1
+        self.device2 = device2
+        self.word_embeddings = nn.Embedding(vocab_size, embed_size).to(self.device1)
+        self.position_embeddings = nn.Embedding(max_length, embed_size).to(self.device1)
+
+        # 分割 Transformer 层：前半部分在 device1，后半部分在 device2
+        self.layers1 = nn.ModuleList([Block(embed_size, heads, dropout, expansion_factor, device1, device2) for _ in range(num_layers // 2)]).to(self.device1)
+        self.layers2 = nn.ModuleList([Block(embed_size, heads, dropout, expansion_factor, device1, device2) for _ in range(num_layers // 2)]).to(self.device2)
+
+        self.fc_out = nn.Linear(embed_size, vocab_size).to(self.device2)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -92,10 +101,22 @@ class GPT2(nn.Module):
         out = self.word_embeddings(x) + self.position_embeddings(positions)
         out = self.dropout(out)
 
-        for layer in self.layers:
+        # 第一部分 Transformer 层计算（在 device1）
+        for layer in self.layers1:
             out = layer(out)
 
-        return self.fc_out(out)
+        # 第二部分 Transformer 层计算（在 device2）
+        out = out.to(self.device2)  # 将数据移到 device2
+        for layer in self.layers2:
+            out = layer(out)
+
+        out = self.fc_out(out)  # 最后的全连接层在 device2 上
+        return out
+
+# 初始化分布式训练
+def init_distributed_mode(args):
+    dist.init_process_group(backend='nccl', init_method="env://")
+    torch.cuda.set_device(args.local_rank)
 
 # 自定义数据集类
 class CustomDataset(Dataset):
@@ -146,90 +167,40 @@ test_dataset = CustomDataset(test_tokens)
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=collate_fn)
 
-# 设置分布式环境
-rank = int(os.environ["RANK"])  # 当前进程的 rank
-world_size = int(os.environ["WORLD_SIZE"])  # 总的进程数
-init_process_group(backend='nccl', rank=rank, world_size=world_size)
+# 训练模型
+parser = argparse.ArgumentParser()
+parser.add_argument('--local_rank', type=int, help='Local rank for distributed training')
+args = parser.parse_args()
 
-# 设置设备网格，跨两个节点
-device_mesh = init_device_mesh("cuda", (world_size, 1), mesh_dim_names=("tp","other"))
-tp_mesh = device_mesh["tp"]
+init_distributed_mode(args)
 
-# 创建模型并并行化
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = GPT2(embed_size, heads, num_layers, vocab_size, max_length, dropout, expansion_factor).to(device)
+device1 = torch.device("cuda:0")
+device2 = torch.device("cuda:1")
 
-# 通过张量并行化模型
-model = parallelize_module(
-    model,
-    tp_mesh,
-    {
-        "word_embeddings": RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(0)),
-        "fc_out": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate())
-    }
-)
-
-# 使用 DistributedDataParallel 包装模型以支持分布式训练
-model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank], output_device=rank)
-
+model = GPT2(embed_size, heads, num_layers, vocab_size, max_length, dropout, expansion_factor, device1, device2).to(device1)
 optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
 loss_fn = nn.CrossEntropyLoss()
 scaler = GradScaler()
 
-# 训练模型
 batch_time = []
-flops_time = []
 for epoch in range(num_epochs):
     model.train()
     epoch_start_time = time.time()
     for i, batch in enumerate(train_loader):
         batch_start_time = time.time()
-        batch = batch.to(device).long()
+        batch = batch.to(device1).long()
         optimizer.zero_grad()
-
-        # 使用 thop.profile 计算 FLOPS
         with autocast():
             output = model(batch)
             loss = loss_fn(output.view(-1, vocab_size), batch.view(-1))
-
-        # 计算 FLOPS
-        flops, params = profile(model, inputs=(batch,))
-        flops_time.append(flops)
-
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
         batch_end_time = time.time()
         batch_time.append(batch_end_time - batch_start_time)
-        
-        print(f"Epoch {epoch + 1}, Batch {i + 1}/{len(train_loader)}, Loss: {loss.item()}, Time: {batch_end_time - batch_start_time:.2f}s, FLOPS: {flops / 1e9:.2f} GFLOPS")
-
+        print(f"Epoch {epoch + 1}, Batch {i + 1}/{len(train_loader)}, Loss: {loss.item()}, Time: {batch_end_time - batch_start_time:.4f}s")
+        if i % 1000 == 0:
+            print(f"Avg time per batch: {sum(batch_time) / len(batch_time):.4f}s")
+    
     epoch_end_time = time.time()
-    print(f"Epoch {epoch + 1} completed in {(epoch_end_time-epoch_start_time):.2f}s")
-    print()
-
-# 打印每个 epoch 的平均时间
-average_batch_time = sum(batch_time) / len(batch_time)
-print(f"Average batch time: {average_batch_time:.4f}s")
-
-# 打印每个batch的FLOPS平均值
-average_flops = sum(flops_time) / len(flops_time)
-print(f"Average FLOPS per batch: {average_flops / 1e9:.2f} GFLOPS")
-
-# 保存模型
-if rank == 0:
-    torch.save(model.state_dict(), "../model/gpt2_model.pth")
-    print("Model saved as gpt2_model.pth")
-
-# 测试模型
-model.eval()
-total_loss = 0
-with torch.no_grad():
-    for batch in test_loader:
-        batch = batch.to(device).long()
-        with autocast():
-            output = model(batch)
-            loss = loss_fn(output.view(-1, vocab_size), batch.view(-1))
-        total_loss += loss.item()
-
-print(f"Test Loss: {total_loss / len(test_loader)}")
+    print(f"Epoch {epoch + 1} completed in {(epoch_end_time-epoch_start_time):.4f}s")

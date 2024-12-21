@@ -159,30 +159,10 @@ for epoch in range(num_epochs):
         scaler.update()
         batch_end_time = time.time()
         batch_time.append(batch_end_time - batch_start_time)
-        print(f"Epoch {epoch + 1}, Batch {i + 1}/{len(train_loader)}, Loss: {loss.item()}, Time: {batch_end_time - batch_start_time:.2f}s")
+        print(f"Epoch {epoch + 1}, Batch {i + 1}/{len(train_loader)}, Loss: {loss.item()}, Time: {batch_end_time - batch_start_time:.4f}s")
+        if i % 1000 == 0:
+            print(f"Avg time per batch: {sum(batch_time) / len(batch_time):.4f}s")
     
     epoch_end_time = time.time()
 
-    print(f"Epoch {epoch + 1} completed in {(epoch_end_time-epoch_start_time):.2f}s")
-    print()
-
-# 打印每个 epoch 的平均时间
-average_batch_time = sum(batch_time) / len(batch_time)
-print(f"Average batch time: {average_batch_time:.4f}s")
-
-# 保存模型
-torch.save(model.state_dict(), "../model/gpt2_model.pth")
-print("Model saved as gpt2_model.pth")
-
-# 测试模型
-model.eval()
-total_loss = 0
-with torch.no_grad():
-    for batch in test_loader:
-        batch = batch.to(device).long()
-        with autocast():
-            output = model(batch)
-            loss = loss_fn(output.view(-1, vocab_size), batch.view(-1))
-        total_loss += loss.item()
-
-print(f"Test Loss: {total_loss / len(test_loader)}")
+    print(f"Epoch {epoch + 1} completed in {(epoch_end_time-epoch_start_time):.4f}s")
