@@ -6,11 +6,19 @@ from torch.utils.data import DataLoader, Dataset
 from torch.cuda.amp import GradScaler, autocast
 import time
 from datasets import load_dataset
+import os
 
 # 初始化分布式环境
 def init_distributed():
-    dist.init_process_group(backend='nccl')  # 使用 NCCL 后端进行高效的 GPU 通信
-    torch.cuda.set_device(dist.get_rank())  # 将每个进程绑定到对应的 GPU
+    dist.init_process_group(
+        backend="nccl", 
+        init_method="tcp://192.168.123.199:2024",  # 主节点的 IP 和端口
+        world_size=int(os.environ["WORLD_SIZE"]), 
+        rank=int(os.environ["RANK"])
+    )
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank
 
 # 自定义数据集类
 class CustomDataset(Dataset):
