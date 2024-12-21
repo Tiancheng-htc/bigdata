@@ -59,20 +59,20 @@ if os.path.exists('../train_dataset.pkl') :
         train_dataset = pickle.load(f)
 
 # 数据预处理
-def preprocess_data(data):
-    tokenizer = lambda text: [ord(c) for c in text]  # 简单的字符级 tokenizer
-    return [tokenizer(item['text'])[:max_length] for item in data]
+# def preprocess_data(data):
+#     tokenizer = lambda text: [ord(c) for c in text]  # 简单的字符级 tokenizer
+#     return [tokenizer(item['text'])[:max_length] for item in data]
 
-train_tokens = preprocess_data(dataset['train'])
-test_tokens = preprocess_data(dataset['test'])
+# train_tokens = preprocess_data(dataset['train'])
+# test_tokens = preprocess_data(dataset['test'])
 
-# 创建自定义数据集
-train_dataset = CustomDataset(train_tokens)
-test_dataset = CustomDataset(test_tokens)
+# # 创建自定义数据集
+# train_dataset = CustomDataset(train_tokens)
+# test_dataset = CustomDataset(test_tokens)
 
 # 创建 DataLoader
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=collate_fn)
+# test_loader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=collate_fn)
 
 # 自定义 GPT-2 网络结构
 class MultiHeadSelfAttention(nn.Module):
