@@ -12,6 +12,8 @@ from torch.distributed.tensor.parallel import RowwiseParallel, ColwiseParallel, 
 import torch.distributed as dist
 from thop import profile  # 导入 thop
 
+# print(torch.__version__)
+
 # 自定义的 GPT-2 网络结构
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, embed_size, heads):
