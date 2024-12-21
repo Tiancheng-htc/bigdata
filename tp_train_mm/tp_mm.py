@@ -151,7 +151,7 @@ world_size = int(os.environ["WORLD_SIZE"])  # 总的进程数
 init_process_group(backend='nccl', rank=rank, world_size=world_size)
 
 # 设置设备网格，跨两个节点
-device_mesh = init_device_mesh("cuda", (world_size, 1), mesh_dim_names=("tp",))
+device_mesh = init_device_mesh("cuda", (world_size), mesh_dim_names=("tp",))
 tp_mesh = device_mesh["tp"]
 
 # 创建模型并并行化
