@@ -7,7 +7,8 @@ from torch.cuda.amp import GradScaler, autocast
 import os
 import time
 from torch.distributed import init_process_group
-from torch.distributed.tensor.parallel import init_device_mesh, parallelize_module
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor.parallel import parallelize_module
 from torch.distributed.tensor.parallel import RowwiseParallel, ColwiseParallel, Shard, Replicate
 import torch.distributed as dist
 from thop import profile  # 导入 thop
